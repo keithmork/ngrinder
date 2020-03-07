@@ -1,4 +1,4 @@
-/* 
+/*
  * Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
  *  You may obtain a copy of the License at
@@ -9,7 +9,7 @@
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
- * limitations under the License. 
+ * limitations under the License.
  */
 package org.ngrinder.script.service;
 
@@ -26,7 +26,6 @@ import org.ngrinder.script.model.FileType;
 import org.ngrinder.script.repository.FileEntryRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -45,13 +44,15 @@ import javax.annotation.PostConstruct;
 import java.io.File;
 import java.net.MalformedURLException;
 import java.net.URL;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import lombok.RequiredArgsConstructor;
+
 import static com.google.common.collect.Lists.newArrayList;
 import static java.util.Collections.unmodifiableList;
+import static org.ngrinder.common.constant.CacheConstants.CACHE_FILE_ENTRIES;
 import static org.ngrinder.common.util.CollectionUtils.buildMap;
 import static org.ngrinder.common.util.CollectionUtils.newHashMap;
 import static org.ngrinder.common.util.ExceptionUtils.processException;
@@ -64,30 +65,23 @@ import static org.ngrinder.common.util.Preconditions.checkNotNull;
  * This class is responsible for creating user svn repository whenever a user is
  * created and connect the user to the underlying svn.
  *
- * @author JunHo Yoon
  * @since 3.0
  */
 @Service
+@RequiredArgsConstructor
 public class FileEntryService {
 
 	private static final Logger LOG = LoggerFactory.getLogger(FileEntryService.class);
 
+	private final Config config;
+
+	private final CacheManager cacheManager;
+
+	private final FileEntryRepository fileEntityRepository;
+
+	private final ScriptHandlerFactory scriptHandlerFactory;
+
 	private SVNClientManager svnClientManager;
-
-	@Autowired
-	private Config config;
-
-
-	@Autowired
-	@Qualifier("cacheManager")
-	private CacheManager cacheManager;
-
-	@SuppressWarnings("SpringJavaAutowiringInspection")
-	@Autowired
-	private FileEntryRepository fileEntityRepository;
-
-	@Autowired
-	private ScriptHandlerFactory scriptHandlerFactory;
 
 	private Cache fileEntryCache;
 
@@ -99,7 +93,7 @@ public class FileEntryService {
 		// Add cache invalidation hook.
 		FSHooks.registerHook(new FSHook() {
 			@Override
-			public void onHook(FSHookEvent event) throws SVNException {
+			public void onHook(FSHookEvent event) {
 				if (event.getType().equals(FSHooks.SVN_REPOS_HOOK_POST_COMMIT)) {
 					String name = event.getReposRootDir().getName();
 					invalidateCache(name);
@@ -107,7 +101,7 @@ public class FileEntryService {
 			}
 		});
 		svnClientManager = fileEntityRepository.getSVNClientManager();
-		fileEntryCache = cacheManager.getCache("file_entries");
+		fileEntryCache = cacheManager.getCache(CACHE_FILE_ENTRIES);
 
 	}
 
@@ -154,7 +148,7 @@ public class FileEntryService {
 	 * @param user user
 	 * @return cached {@link FileEntry} list
 	 */
-	@Cacheable(value = "file_entries", key = "#user.userId")
+	@Cacheable(value = CACHE_FILE_ENTRIES, key = "#user.userId")
 	public List<FileEntry> getAll(User user) {
 		prepare(user);
 		List<FileEntry> allFileEntries;
@@ -252,14 +246,9 @@ public class FileEntryService {
 	 * Delete file entries.
 	 *
 	 * @param user     the user
-	 * @param basePath the base path
-	 * @param files    files under base path
+	 * @param fullPathFiles    files in full path
 	 */
-	public void delete(User user, String basePath, String[] files) {
-		List<String> fullPathFiles = new ArrayList<String>();
-		for (String each : files) {
-			fullPathFiles.add(basePath + "/" + each);
-		}
+	public void delete(User user, List<String> fullPathFiles) {
 		fileEntityRepository.delete(user, fullPathFiles);
 	}
 
@@ -318,7 +307,7 @@ public class FileEntryService {
 		if (!"http://please_modify_this.com".equals(url)) {
 			fileEntry.setProperties(buildMap("targetHosts", UrlUtils.getHost(url)));
 		} else {
-			fileEntry.setProperties(new HashMap<String, String>());
+			fileEntry.setProperties(new HashMap<>());
 		}
 		return fileEntry;
 	}

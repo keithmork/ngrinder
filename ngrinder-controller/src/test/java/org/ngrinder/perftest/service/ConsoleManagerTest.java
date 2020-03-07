@@ -16,6 +16,7 @@ package org.ngrinder.perftest.service;
 import net.grinder.SingleConsole;
 import net.grinder.util.ConsolePropertiesFactory;
 import net.grinder.util.NetworkUtils;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.ngrinder.common.exception.NGrinderRuntimeException;
 import org.ngrinder.common.util.ThreadUtils;
@@ -29,12 +30,14 @@ import java.util.List;
 import static org.hamcrest.Matchers.*;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.fail;
+import static org.ngrinder.common.util.NoOp.noOp;
 
 public class ConsoleManagerTest extends AbstractAgentReadyTest {
 	@Autowired
 	private MockConsoleManager manager;
 
 	@Test
+	@Ignore
 	public void testConsoleManager() {
 		int initialSize = manager.getAvailableConsoleSize();
 		SingleConsole availableConsole = manager.getAvailableConsole(
@@ -67,15 +70,12 @@ public class ConsoleManagerTest extends AbstractAgentReadyTest {
 		elapseTime.stop();
 		assertThat(elapseTime.getTotalTimeSeconds(), lessThan(3000D));
 		// Let's try the case when console is returned back.
-		Thread thread = new Thread(new Runnable() {
-			@Override
-			public void run() {
-				try {
-					Thread.sleep(1000);
-					manager.returnBackConsole("test", lastConsole);
-				} catch (InterruptedException e) {
-				}
-
+		Thread thread = new Thread(() -> {
+			try {
+				Thread.sleep(1000);
+				manager.returnBackConsole("test", lastConsole);
+			} catch (InterruptedException e) {
+				noOp();
 			}
 		});
 		elapseTime = new StopWatch();

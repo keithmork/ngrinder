@@ -9,13 +9,14 @@
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
- * limitations under the License. 
+ * limitations under the License.
  */
 package org.ngrinder.perftest.service;
 
 import com.google.common.collect.Lists;
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
 import net.grinder.SingleConsole;
 import net.grinder.StopReason;
 import net.grinder.common.GrinderProperties;
@@ -24,9 +25,8 @@ import net.grinder.console.model.ConsoleProperties;
 import net.grinder.util.ConsolePropertiesFactory;
 import net.grinder.util.Directory;
 import net.grinder.util.Pair;
-import org.apache.commons.collections.CollectionUtils;
+
 import org.apache.commons.collections.MapUtils;
-import org.apache.commons.collections.Predicate;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.io.IOUtils;
@@ -37,11 +37,14 @@ import org.apache.commons.lang.StringUtils;
 import org.hibernate.Hibernate;
 import org.ngrinder.common.constant.ControllerConstants;
 import org.ngrinder.common.constants.GrinderConstants;
+import org.ngrinder.common.util.JsonUtils;
 import org.ngrinder.infra.config.Config;
+import org.ngrinder.infra.hazelcast.HazelcastService;
 import org.ngrinder.model.*;
 import org.ngrinder.monitor.controller.model.SystemDataModel;
 import org.ngrinder.perftest.model.PerfTestStatistics;
 import org.ngrinder.perftest.model.ProcessAndThread;
+import org.ngrinder.perftest.model.SamplingModel;
 import org.ngrinder.perftest.repository.PerfTestRepository;
 import org.ngrinder.script.handler.NullScriptHandler;
 import org.ngrinder.script.handler.ProcessingResultPrintStream;
@@ -53,20 +56,22 @@ import org.ngrinder.service.AbstractPerfTestService;
 import org.python.google.common.collect.Maps;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.jpa.domain.Specifications;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.script.ScriptEngine;
 import javax.script.ScriptEngineManager;
 import javax.script.ScriptException;
+
 import java.io.*;
 import java.util.*;
 import java.util.Map.Entry;
 
+import static java.util.stream.Collectors.toList;
+import static org.ngrinder.common.constant.CacheConstants.*;
 import static org.ngrinder.common.constants.MonitorConstants.MONITOR_FILE_PREFIX;
 import static org.ngrinder.common.util.AccessUtils.getSafe;
 import static org.ngrinder.common.util.CollectionUtils.*;
@@ -74,6 +79,7 @@ import static org.ngrinder.common.util.ExceptionUtils.processException;
 import static org.ngrinder.common.util.NoOp.noOp;
 import static org.ngrinder.common.util.Preconditions.checkNotEmpty;
 import static org.ngrinder.common.util.Preconditions.checkNotNull;
+import static org.ngrinder.common.util.TypeConvertUtils.cast;
 import static org.ngrinder.model.Status.getProcessingOrTestingTestStatus;
 import static org.ngrinder.perftest.repository.PerfTestSpecification.*;
 
@@ -82,10 +88,9 @@ import static org.ngrinder.perftest.repository.PerfTestSpecification.*;
  * <p/>
  * This class contains various method which mainly get the {@link PerfTest} matching specific conditions from DB.
  *
- * @author JunHo Yoon
- * @author Mavlarn
  * @since 3.0
  */
+@RequiredArgsConstructor
 public class PerfTestService extends AbstractPerfTestService implements ControllerConstants, GrinderConstants {
 
 	private static final int MAX_POINT_COUNT = 100;
@@ -94,26 +99,26 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 
 	private static final String DATA_FILE_EXTENSION = ".data";
 
-	@Autowired
-	private PerfTestRepository perfTestRepository;
+	private static final String NULL_STRING = "null";
+	private static final String UNDEFINED_STRING = "undefined";
 
-	@Autowired
-	private ConsoleManager consoleManager;
+	@Getter
+	private final PerfTestRepository perfTestRepository;
 
-	@Autowired
-	private AgentManager agentManager;
+	private final ConsoleManager consoleManager;
 
-	@Autowired
-	private Config config;
+	private final AgentManager agentManager;
 
-	@Autowired
-	private FileEntryService fileEntryService;
+	@Getter
+	private final Config config;
 
-	@Autowired
-	private TagService tagService;
+	private final FileEntryService fileEntryService;
 
-	@Autowired
-	private ScriptHandlerFactory scriptHandlerFactory;
+	private final TagService tagService;
+
+	private final ScriptHandlerFactory scriptHandlerFactory;
+
+	private final HazelcastService hazelcastService;
 
 	/**
 	 * Get {@link PerfTest} list for the given user.
@@ -126,7 +131,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	 * @return found {@link PerfTest} list
 	 */
 	public Page<PerfTest> getPagedAll(User user, String query, String tag, String queryFilter, Pageable pageable) {
-		Specifications<PerfTest> spec = Specifications.where(idEmptyPredicate());
+		Specification<PerfTest> spec = Specification.where(idEmptyPredicate());
 		// User can see only his own test
 		if (user.getRole().equals(Role.USER)) {
 			spec = spec.and(createdBy(user));
@@ -141,7 +146,8 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 			spec = spec.and(statusSetEqual(Status.TESTING));
 		} else if ("S".equals(queryFilter)) {
 			spec = spec.and(statusSetEqual(Status.READY));
-			spec = spec.and(scheduledTimeNotEmptyPredicate());
+		} else if ("RS".equals(queryFilter) || "SR".equals(queryFilter)) {
+			spec = spec.and(statusSetEqual(Status.TESTING, Status.READY));
 		}
 		if (StringUtils.isNotBlank(query)) {
 			spec = spec.and(likeTestNameOrDescription(query));
@@ -155,22 +161,23 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	 * @param user user
 	 * @return found {@link PerfTest} list
 	 */
-	List<PerfTest> getAll(User user) {
-		Specifications<PerfTest> spec = Specifications.where(createdBy(user));
+	private List<PerfTest> getAll(User user) {
+		Specification<PerfTest> spec = Specification.where(createdBy(user));
 		return perfTestRepository.findAll(spec);
 	}
 
 
 	@Override
 	public PerfTest getOne(User user, Long id) {
-		Specifications<PerfTest> spec = Specifications.where(idEmptyPredicate());
+		Specification<PerfTest> spec = Specification.where(idEmptyPredicate());
 
 		// User can see only his own test
 		if (user.getRole().equals(Role.USER)) {
 			spec = spec.and(createdBy(user));
 		}
 		spec = spec.and(idEqual(id));
-		return perfTestRepository.findOne(spec);
+
+		return perfTestRepository.findOne(spec).orElse(null);
 	}
 
 	@Override
@@ -178,7 +185,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 		if (ids.length == 0) {
 			return newArrayList();
 		}
-		Specifications<PerfTest> spec = Specifications.where(idEmptyPredicate());
+		Specification<PerfTest> spec = Specification.where(idEmptyPredicate());
 
 		// User can see only his own test
 		if (user.getRole().equals(Role.USER)) {
@@ -190,7 +197,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 
 	@Override
 	public long count(User user, Status[] statuses) {
-		Specifications<PerfTest> spec = Specifications.where(idEmptyPredicate());
+		Specification<PerfTest> spec = Specification.where(idEmptyPredicate());
 
 		// User can see only his own test
 		if (user != null) {
@@ -207,7 +214,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 
 	@Override
 	public List<PerfTest> getAll(User user, Status[] statuses) {
-		Specifications<PerfTest> spec = Specifications.where(idEmptyPredicate());
+		Specification<PerfTest> spec = Specification.where(idEmptyPredicate());
 
 		// User can see only his own test
 		if (user != null) {
@@ -221,7 +228,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	}
 
 	private List<PerfTest> getAll(User user, String region, Status[] statuses) {
-		Specifications<PerfTest> spec = Specifications.where(idEmptyPredicate());
+		Specification<PerfTest> spec = Specification.where(idEmptyPredicate());
 		// User can see only his own test
 		if (user != null) {
 			spec = spec.and(createdBy(user));
@@ -243,21 +250,20 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 		attachFileRevision(user, perfTest);
 		attachTags(user, perfTest, perfTest.getTagString());
 		return save(perfTest);
-
 	}
 
 	private PerfTest save(PerfTest perfTest) {
 		checkNotNull(perfTest);
 		// Merge if necessary
 		if (perfTest.exist()) {
-			PerfTest existingPerfTest = perfTestRepository.findOne(perfTest.getId());
-			perfTest = existingPerfTest.merge(perfTest);
+			Optional<PerfTest> existingPerfTest = perfTestRepository.findOne(idEqual(perfTest.getId()));
+			existingPerfTest.ifPresent(perfTest1 -> perfTest1.merge(perfTest));
 		} else {
 			perfTest.clearMessages();
+			perfTestRepository.saveAndFlush(perfTest);
 		}
-		return perfTestRepository.saveAndFlush(perfTest);
+		return perfTest;
 	}
-
 
 	private void attachFileRevision(User user, PerfTest perfTest) {
 		if (perfTest.getStatus() == Status.READY) {
@@ -269,32 +275,18 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 
 	private void attachTags(User user, PerfTest perfTest, String tagString) {
 		SortedSet<Tag> tags = tagService.addTags(user,
-				StringUtils.split(StringUtils.trimToEmpty(tagString), ","));
+			StringUtils.split(StringUtils.trimToEmpty(tagString), ","));
 		perfTest.setTags(tags);
 		perfTest.setTagString(buildTagString(tags));
 	}
 
 	private String buildTagString(Set<Tag> tags) {
-		List<String> tagStringResult = new ArrayList<String>();
+		List<String> tagStringResult = new ArrayList<>();
 		for (Tag each : tags) {
 			tagStringResult.add(each.getTagValue());
 		}
 		return StringUtils.join(tagStringResult, ",");
 	}
-
-	/**
-	 * Update runtime statistics on {@link PerfTest} having the given id.
-	 *
-	 * @param id            id of {@link PerfTest}
-	 * @param runningSample runningSample json string
-	 * @param agentState    agentState json string
-	 */
-	@Transactional
-	public void updateRuntimeStatistics(Long id, String runningSample, String agentState) {
-		perfTestRepository.updateRuntimeStatistics(id, runningSample, agentState);
-		perfTestRepository.flush();
-	}
-
 
 	/**
 	 * Mark test error on {@link PerfTest} instance.
@@ -318,7 +310,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	@Transactional
 	public PerfTest markAbnormalTermination(PerfTest perfTest, String reason) {
 		// Leave last status as test error cause
-		perfTest.setTestErrorCause(perfTest.getStatus());
+		perfTest.setTestErrorCause(cast(perfTest.getStatus()));
 		return markStatusAndProgress(perfTest, Status.ABNORMAL_TESTING, reason);
 	}
 
@@ -387,24 +379,27 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	public PerfTest markPerfTestConsoleStart(PerfTest perfTest, int consolePort) {
 		perfTest.setPort(consolePort);
 		return markProgressAndStatus(perfTest, Status.START_CONSOLE_FINISHED, "Console is started on port "
-				+ consolePort);
+			+ consolePort);
 	}
 
 
 	@Transactional
 	@Override
 	public PerfTest getOneWithTag(Long testId) {
-		PerfTest findOne = perfTestRepository.findOne(testId);
-		if (findOne != null) {
-			Hibernate.initialize(findOne.getTags());
+		Optional<PerfTest> findOne = perfTestRepository.findOne(idEqual(testId));
+		PerfTest perfTest = null;
+
+		if (findOne.isPresent()) {
+			perfTest = findOne.get();
+			Hibernate.initialize(perfTest.getTags());
 		}
-		return findOne;
+		return perfTest;
 	}
 
 
 	@Override
 	public PerfTest getOne(Long testId) {
-		return perfTestRepository.findOne(testId);
+		return perfTestRepository.findOne(idEqual(testId)).orElse(null);
 	}
 
 	/**
@@ -440,14 +435,9 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 		for (PerfTest each : currentlyRunningTests) {
 			currentlyRunningTestOwners.add(each.getCreatedUser());
 		}
-		CollectionUtils.filter(perfTestLists, new Predicate() {
-			@Override
-			public boolean evaluate(Object object) {
-				PerfTest perfTest = (PerfTest) object;
-				return !currentlyRunningTestOwners.contains(perfTest.getCreatedUser());
-			}
-		});
-		return perfTestLists;
+		return perfTestLists.stream()
+			.filter(perfTest -> !currentlyRunningTestOwners.contains(perfTest.getCreatedUser()))
+			.collect(toList());
 	}
 
 	@Override
@@ -492,7 +482,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 
 	/*
 	 * (non-Javadoc)
-	 * 
+	 *
 	 * @see org.ngrinder.service.IPerfTestService#getPerfTestFilePath(org .ngrinder.perftest. model.PerfTest)
 	 */
 	@Override
@@ -502,7 +492,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 
 	/*
 	 * (non-Javadoc)
-	 * 
+	 *
 	 * @see org.ngrinder.service.IPerfTestService#getPerfTestFilePath(org .ngrinder.perftest. model.PerfTest)
 	 */
 	@Override
@@ -526,14 +516,11 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 		customClassPath.append(".");
 		if (libFolder.exists()) {
 			customClassPath.append(File.pathSeparator).append("lib");
-			libFolder.list(new FilenameFilter() {
-				@Override
-				public boolean accept(File dir, String name) {
-					if (name.endsWith(".jar")) {
-						customClassPath.append(File.pathSeparator).append("lib/").append(name);
-					}
-					return true;
+			libFolder.list((dir, name) -> {
+				if (name.endsWith(".jar")) {
+					customClassPath.append(File.pathSeparator).append("lib/").append(name);
 				}
+				return true;
 			});
 		}
 		return customClassPath.toString();
@@ -566,7 +553,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 			// Get all files in the script path
 			String scriptName = perfTest.getScriptName();
 			FileEntry userDefinedGrinderProperties = fileEntryService.getOne(user,
-					FilenameUtils.concat(FilenameUtils.getPath(scriptName), DEFAULT_GRINDER_PROPERTIES), -1L);
+				FilenameUtils.concat(FilenameUtils.getPath(scriptName), DEFAULT_GRINDER_PROPERTIES), -1L);
 			if (!config.isSecurityEnabled() && userDefinedGrinderProperties != null) {
 				// Make the property overridden by user property.
 				GrinderProperties userProperties = new GrinderProperties();
@@ -612,6 +599,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 			grinderProperties.setProperty(GRINDER_PROP_JVM_CLASSPATH, getCustomClassPath(perfTest));
 			grinderProperties.setInt(GRINDER_PROP_IGNORE_SAMPLE_COUNT, getSafe(perfTest.getIgnoreSampleCount()));
 			grinderProperties.setBoolean(GRINDER_PROP_SECURITY, config.isSecurityEnabled());
+			grinderProperties.setProperty(GRINDER_PROP_SECURITY_LEVEL, config.getSecurityLevel());
 			// For backward agent compatibility.
 			// If the security is not enabled, pass it as jvm argument.
 			// If enabled, pass it to grinder.param. In this case, I drop the
@@ -664,6 +652,19 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 			throw processException("Error while file distribution is prepared.");
 		}
 		return handler;
+	}
+
+	public GrinderProperties prepareTest(PerfTest perfTest) {
+		cleanupPerftestDistibutionFolder(perfTest);
+		ScriptHandler prepareDistribution = prepareDistribution(perfTest);
+		return getGrinderProperties(perfTest, prepareDistribution);
+	}
+
+	private void cleanupPerftestDistibutionFolder(PerfTest perfTest) {
+		File distributedFolder = config.getHome().getDistributedFolderName(perfTest.getId().toString());
+		if (distributedFolder.exists()) {
+			FileUtils.deleteQuietly(distributedFolder);
+		}
 	}
 
 	/**
@@ -810,16 +811,15 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	 * @param singleConsole single console.
 	 * @param perfTestId    perfTest Id
 	 */
-	@Transactional
 	public void saveStatistics(SingleConsole singleConsole, Long perfTestId) {
 		String runningSample = getProperSizeRunningSample(singleConsole);
 		String agentState = getProperSizedStatusString(singleConsole);
-		updateRuntimeStatistics(perfTestId, runningSample, agentState);
+		hazelcastService.put(DIST_MAP_NAME_SAMPLING, perfTestId, new SamplingModel(runningSample, agentState));
 	}
 
 	private String getProperSizeRunningSample(SingleConsole singleConsole) {
 		Map<String, Object> statisticData = singleConsole.getStatisticsData();
-		String runningSample = gson.toJson(statisticData);
+		String runningSample = JsonUtils.serialize(statisticData);
 
 		if (runningSample.length() > 9950) { // max column size is 10,000
 			Map<String, Object> tempData = newHashMap();
@@ -831,7 +831,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 				}
 				tempData.put(key, each.getValue());
 			}
-			runningSample = gson.toJson(tempData);
+			runningSample = JsonUtils.serialize(tempData);
 		}
 		return runningSample;
 	}
@@ -845,14 +845,14 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	public String getProperSizedStatusString(SingleConsole singleConsole) {
 		Map<String, SystemDataModel> agentStatusMap = Maps.newHashMap();
 		final int singleConsolePort = singleConsole.getConsolePort();
-		for (AgentStatus each : agentManager.getAgentStatusSetConnectingToPort(singleConsolePort)) {
+		for (AgentStatus each : agentManager.getAttachedAgentStatusSetConnectingToPort(singleConsolePort)) {
 			agentStatusMap.put(each.getAgentName(), each.getSystemDataModel());
 		}
 		return getProperSizedStatusString(agentStatusMap);
 	}
 
 	String getProperSizedStatusString(Map<String, SystemDataModel> agentStatusMap) {
-		String json = gson.toJson(agentStatusMap);
+		String json = JsonUtils.serialize(agentStatusMap);
 		int statusLength = StringUtils.length(json);
 		if (statusLength > 9950) { // max column size is 10,000
 			LOGGER.info("Agent status string length: {}, too long to save into table.", statusLength);
@@ -867,41 +867,15 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 					pickIndex++;
 				}
 			}
-			json = gson.toJson(pickAgentStateMap);
-			LOGGER.debug("Agent status string get {} outof {} agents, new size is {}.", new Object[]{pickSize,
-					agentStatusMap.size(), json.length()});
+			json = JsonUtils.serialize(pickAgentStateMap);
+			LOGGER.debug("Agent status string get {} outof {} agents, new size is {}.", pickSize, agentStatusMap.size(), json.length());
 		}
 		return json;
 	}
 
-	/**
-	 * get test running statistic data from cache. If there is no cache data, will return empty statistic data.
-	 *
-	 * @param perfTest perfTest
-	 * @return test running statistic data
-	 */
-	@SuppressWarnings("unchecked")
-	public Map<String, Object> getStatistics(PerfTest perfTest) {
-		return gson.fromJson(perfTest.getRunningSample(), HashMap.class);
-	}
-
-
-	private Gson gson = new GsonBuilder().excludeFieldsWithoutExposeAnnotation().create();
-
-	/**
-	 * Get agent info from saved file.
-	 *
-	 * @param perfTest perftest
-	 * @return agent info map
-	 */
-	@SuppressWarnings({"unchecked", "rawtypes"})
-	public Map<String, HashMap> getAgentStat(PerfTest perfTest) {
-		return gson.fromJson(perfTest.getAgentState(), HashMap.class);
-	}
-
 	/*
 	 * (non-Javadoc)
-	 * 
+	 *
 	 * @see org.ngrinder.service.IPerfTestService#getAllPerfTest()
 	 */
 	@Override
@@ -934,14 +908,15 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	}
 
 	/**
-	 * Check if the given perfTest has too many errors. (20%)
+	 * Check if the given perfTest has too many errors. (30%)
 	 *
 	 * @param perfTest perftest
 	 * @return true if too many errors.
 	 */
 	@SuppressWarnings("unchecked")
 	public boolean hasTooManyError(PerfTest perfTest) {
-		Map<String, Object> result = getStatistics(perfTest);
+		SamplingModel samplingModel = hazelcastService.get(DIST_MAP_NAME_SAMPLING, perfTest.getId());
+		Map<String, Object> result = JsonUtils.deserialize(samplingModel.getRunningSample(), HashMap.class);
 		Map<String, Object> totalStatistics = MapUtils.getMap(result, "totalStatistics", MapUtils.EMPTY_MAP);
 		long tests = MapUtils.getDouble(totalStatistics, "Tests", 0D).longValue();
 		long errors = MapUtils.getDouble(totalStatistics, "Errors", 0D).longValue();
@@ -964,7 +939,6 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 		perfTest.setPeakTps(parseDoubleWithSafety(totalStatistics, "Peak_TPS", 0D));
 		perfTest.setTests(MapUtils.getDouble(totalStatistics, "Tests", 0D).longValue());
 		perfTest.setErrors(MapUtils.getDouble(totalStatistics, "Errors", 0D).longValue());
-
 	}
 
 	/**
@@ -989,7 +963,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 
 	/*
 	 * (non-Javadoc)
-	 * 
+	 *
 	 * @see org.ngrinder.service.IPerfTestService#stop(org.ngrinder .model.User, java.lang.Long)
 	 */
 	@Override
@@ -1025,24 +999,20 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 
 	/*
 	 * (non-Javadoc)
-	 * 
+	 *
 	 * @see org.ngrinder.service.IPerfTestService#getAllStopRequested()
 	 */
 	@Override
 	public List<PerfTest> getAllStopRequested() {
 		final List<PerfTest> perfTests = getAll(null, config.getRegion(), getProcessingOrTestingTestStatus());
-		CollectionUtils.filter(perfTests, new Predicate() {
-			@Override
-			public boolean evaluate(Object object) {
-				return (((PerfTest) object).getStopRequest() == Boolean.TRUE);
-			}
-		});
-		return perfTests;
+		return perfTests.stream()
+			.filter(PerfTest::getStopRequest)
+			.collect(toList());
 	}
 
 	/*
 	 * (non-Javadoc)
-	 * 
+	 *
 	 * @see org.ngrinder.service.IPerfTestService#addCommentOn(org.ngrinder .model.User, int, java.lang.String)
 	 */
 	@Override
@@ -1059,7 +1029,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	 *
 	 * @return PerfTestStatisticsList PerfTestStatistics list
 	 */
-	@Cacheable("current_perftest_statistics")
+	@Cacheable(CACHE_CURRENT_PERFTEST_STATISTICS)
 	@Transactional
 	public Collection<PerfTestStatistics> getCurrentPerfTestStatistics() {
 		Map<User, PerfTestStatistics> perfTestPerUser = newHashMap();
@@ -1098,25 +1068,12 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 		for (PerfTest each : perfTestList) {
 			each.getTags().clear();
 		}
-		perfTestRepository.save(perfTestList);
+		perfTestRepository.saveAll(perfTestList);
 		perfTestRepository.flush();
-		perfTestRepository.delete(perfTestList);
+		perfTestRepository.deleteAll(perfTestList);
 		perfTestRepository.flush();
 		tagService.deleteTags(user);
 		return perfTestList;
-	}
-
-
-	public PerfTestRepository getPerfTestRepository() {
-		return perfTestRepository;
-	}
-
-	public Config getConfig() {
-		return config;
-	}
-
-	public void setConfig(Config config) {
-		this.config = config;
 	}
 
 	/**
@@ -1129,26 +1086,13 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	}
 
 	/**
-	 * Clean up the data which is used in runtime only.
-	 *
-	 * @param perfTest perfTest
-	 */
-	public void cleanUpRuntimeOnlyData(PerfTest perfTest) {
-		perfTest.setRunningSample("");
-		perfTest.setAgentState("");
-		perfTest.setMonitorState("");
-		save(perfTest);
-	}
-
-	/**
 	 * Put the given {@link org.ngrinder.monitor.share.domain.SystemInfo} maps into the given perftest entity.
 	 *
 	 * @param perfTestId  id of perf test
 	 * @param systemInfos systemDataModel map
 	 */
-	@Transactional
 	public void updateMonitorStat(Long perfTestId, Map<String, SystemDataModel> systemInfos) {
-		String json = gson.toJson(systemInfos);
+		String json = JsonUtils.serialize(systemInfos);
 		if (json.length() >= 2000) {
 			Map<String, SystemDataModel> systemInfo = Maps.newHashMap();
 			int i = 0;
@@ -1158,20 +1102,9 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 				}
 				systemInfo.put(each.getKey(), each.getValue());
 			}
-			json = gson.toJson(systemInfo);
+			json = JsonUtils.serialize(systemInfo);
 		}
-		perfTestRepository.updatetMonitorStatus(perfTestId, json);
-	}
-
-	/**
-	 * Get monitor status map for the given perfTest.
-	 *
-	 * @param perfTest perf test
-	 * @return map of monitor name and monitor status.
-	 */
-	@SuppressWarnings({"unchecked", "rawtypes"})
-	public Map<String, HashMap> getMonitorStat(PerfTest perfTest) {
-		return gson.fromJson(perfTest.getMonitorState(), HashMap.class);
+		hazelcastService.put(DIST_MAP_NAME_MONITORING , perfTestId , json);
 	}
 
 	/**
@@ -1221,22 +1154,21 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	 * @param dataInterval interval value to get data. Interval value "2" means, get one record for every "2" records.
 	 * @return return the data in map
 	 */
-	public Map<String, String> getMonitorGraph(long testId, String targetIP, int dataInterval) {
-		Map<String, String> returnMap = Maps.newHashMap();
+	public Map<String, Object> getMonitorGraph(long testId, String targetIP, int dataInterval) {
+		Map<String, Object> returnMap = Maps.newHashMap();
 		File monitorDataFile = new File(config.getHome().getPerfTestReportDirectory(String.valueOf(testId)),
 				MONITOR_FILE_PREFIX + targetIP + ".data");
 		BufferedReader br = null;
 		try {
-
-			StringBuilder sbUsedMem = new StringBuilder("[");
-			StringBuilder sbCPUUsed = new StringBuilder("[");
-			StringBuilder sbNetReceived = new StringBuilder("[");
-			StringBuilder sbNetSent = new StringBuilder("[");
-			StringBuilder customData1 = new StringBuilder("[");
-			StringBuilder customData2 = new StringBuilder("[");
-			StringBuilder customData3 = new StringBuilder("[");
-			StringBuilder customData4 = new StringBuilder("[");
-			StringBuilder customData5 = new StringBuilder("[");
+			List<Long> userMemoryMetrics = new ArrayList<>();
+			List<String> cpuUsedMetrics = new ArrayList<>();
+			List<String> networkReceivedMetrics = new ArrayList<>();
+			List<String> networkSentMetrics = new ArrayList<>();
+			List<String> customData1Metrics = new ArrayList<>();
+			List<String> customData2Metrics = new ArrayList<>();
+			List<String> customData3Metrics = new ArrayList<>();
+			List<String> customData4Metrics = new ArrayList<>();
+			List<String> customData5Metrics = new ArrayList<>();
 
 			br = new BufferedReader(new FileReader(monitorDataFile));
 			br.readLine(); // skip the header.
@@ -1248,34 +1180,34 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 			while (StringUtils.isNotBlank(line)) {
 				if (skipCount < dataInterval) {
 					skipCount++;
-				} else {
-					skipCount = 1;
-					String[] datalist = StringUtils.split(line, ",");
-					if ("null".equals(datalist[4]) || "undefined".equals(datalist[4])) {
-						sbUsedMem.append("null").append(",");
-					} else {
-						sbUsedMem.append(Long.valueOf(datalist[4]) - Long.valueOf(datalist[3])).append(",");
-					}
-					addCustomData(sbCPUUsed, 5, datalist);
-					addCustomData(sbNetReceived, 6, datalist);
-					addCustomData(sbNetSent, 7, datalist);
-					addCustomData(customData1, 8, datalist);
-					addCustomData(customData2, 9, datalist);
-					addCustomData(customData3, 10, datalist);
-					addCustomData(customData4, 11, datalist);
-					addCustomData(customData5, 12, datalist);
 					line = br.readLine();
+				} else {
+					skipCount = 0;
+					String[] dataList = StringUtils.split(line, ",");
+					if (NULL_STRING.equals(dataList[4]) || UNDEFINED_STRING.equals(dataList[4])) {
+						userMemoryMetrics.add(null);
+					} else {
+						userMemoryMetrics.add(Long.valueOf(dataList[4]) - Long.valueOf(dataList[3]));
+					}
+					addCustomData(cpuUsedMetrics, 5, dataList);
+					addCustomData(networkReceivedMetrics, 6, dataList);
+					addCustomData(networkSentMetrics, 7, dataList);
+					addCustomData(customData1Metrics, 8, dataList);
+					addCustomData(customData2Metrics, 9, dataList);
+					addCustomData(customData3Metrics, 10, dataList);
+					addCustomData(customData4Metrics, 11, dataList);
+					addCustomData(customData5Metrics, 12, dataList);
 				}
 			}
-			completeCustomData(returnMap, "cpu", sbCPUUsed);
-			completeCustomData(returnMap, "memory", sbUsedMem);
-			completeCustomData(returnMap, "received", sbNetReceived);
-			completeCustomData(returnMap, "sent", sbNetSent);
-			completeCustomData(returnMap, "customData1", customData1);
-			completeCustomData(returnMap, "customData2", customData2);
-			completeCustomData(returnMap, "customData3", customData3);
-			completeCustomData(returnMap, "customData4", customData4);
-			completeCustomData(returnMap, "customData5", customData5);
+			returnMap.put("cpu", cpuUsedMetrics);
+			returnMap.put("memory", userMemoryMetrics);
+			returnMap.put("received", networkReceivedMetrics);
+			returnMap.put("sent", networkSentMetrics);
+			returnMap.put("customData1", customData1Metrics);
+			returnMap.put("customData2", customData2Metrics);
+			returnMap.put("customData3", customData3Metrics);
+			returnMap.put("customData4", customData4Metrics);
+			returnMap.put("customData5", customData5Metrics);
 		} catch (IOException e) {
 			LOGGER.info("Error while getting monitor {} data file at {}", targetIP, monitorDataFile);
 		} finally {
@@ -1285,19 +1217,11 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	}
 
 
-	private void addCustomData(StringBuilder customData, int index, String[] data) {
+	private <T> void addCustomData(List<T> list, int index, T[] data) {
 		if (data.length > index) {
-			customData.append(data[index]).append(",");
+			list.add(data[index]);
 		}
 	}
-
-	private void completeCustomData(Map<String, String> returnMap, String key, StringBuilder customData) {
-		if (customData.charAt(customData.length() - 1) == ',') {
-			customData.deleteCharAt(customData.length() - 1);
-		}
-		returnMap.put(key, customData.append("]").toString());
-	}
-
 
 	/**
 	 * Get report file directory for give test id .
@@ -1407,7 +1331,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 			StringBuilder headerSB = new StringBuilder("[");
 			String[] headers = StringUtils.split(header, ",");
 			String[] refinedHeaders = StringUtils.split(header, ",");
-			List<StringBuilder> dataStringBuilders = new ArrayList<StringBuilder>(headers.length);
+			List<StringBuilder> dataStringBuilders = new ArrayList<>(headers.length);
 
 			for (int i = 0; i < headers.length; i++) {
 				dataStringBuilders.add(new StringBuilder("["));
@@ -1424,8 +1348,9 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 			while (StringUtils.isNotBlank(line)) {
 				if (skipCount < interval) {
 					skipCount++;
+					line = br.readLine();
 				} else {
-					skipCount = 1;
+					skipCount = 0;
 					String[] records = StringUtils.split(line, ",");
 					for (int i = 0; i < records.length; i++) {
 						if ("null".equals(records[i]) || "undefined".equals(records[i])) {
@@ -1434,7 +1359,6 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 							dataStringBuilders.get(i).append(records[i]).append(",");
 						}
 					}
-					line = br.readLine();
 				}
 			}
 			for (int i = 0; i < refinedHeaders.length; i++) {
@@ -1454,7 +1378,6 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 		return returnMap;
 	}
 
-
 	/**
 	 * Get json string that contains test report data as a json string.
 	 *
@@ -1463,9 +1386,9 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	 * @param interval interval to collect data
 	 * @return json list
 	 */
-	public String getSingleReportDataAsJson(long testId, String key, int interval) {
+	public List<Float> getSingleReportData(long testId, String key, int interval) {
 		File reportDataFile = getReportDataFile(testId, key);
-		return getFileDataAsJson(reportDataFile, interval);
+		return getFileDataAsList(reportDataFile, interval);
 	}
 
 	/**
@@ -1477,21 +1400,21 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 	 * @param interval interval to collect data
 	 * @return list containing label and tps value list
 	 */
-	public Pair<ArrayList<String>, ArrayList<String>> getReportData(long testId, String key, boolean onlyTotal, int interval) {
-		Pair<ArrayList<String>, ArrayList<String>> resultPair = Pair.of(new ArrayList<String>(),
-				new ArrayList<String>());
+	public Map<String, List<Float>> getReportData(long testId, String key, boolean onlyTotal, int interval) {
+		Map<String, List<Float>> resultMap = new HashMap<>();
 		List<File> reportDataFiles = onlyTotal ? Lists.newArrayList(getReportDataFile(testId, key)) : getReportDataFiles(testId, key);
-		for (File file : reportDataFiles) {
-			String buildReportName = buildReportName(key, file);
-			if (key.equals(buildReportName)) {
-				buildReportName = "Total";
+		reportDataFiles.forEach(each -> {
+			String reportName = buildReportName(key, each);
+			if (key.equals(reportName)) {
+				reportName = "Total";
 			} else {
-				buildReportName = buildReportName.replace("_", " ");
+				reportName = reportName.replace("_", " ");
 			}
-			resultPair.getFirst().add(buildReportName);
-			resultPair.getSecond().add(getFileDataAsJson(file, interval));
-		}
-		return resultPair;
+
+			resultMap.put(reportName, getFileDataAsList(each, interval));
+		});
+
+		return resultMap;
 	}
 
 	private String buildReportName(String key, File file) {
@@ -1505,7 +1428,6 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 		}
 		return reportName;
 	}
-
 	/**
 	 * Get a single file for the given report key.
 	 *
@@ -1529,60 +1451,45 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 		File reportFolder = config.getHome().getPerfTestReportDirectory(String.valueOf(testId));
 		FileFilter fileFilter = new WildcardFileFilter(key + "*.data");
 		File[] files = reportFolder.listFiles(fileFilter);
-		Arrays.sort(files, new Comparator<File>() {
-			@Override
-			public int compare(File o1, File o2) {
-				return FilenameUtils.getBaseName(o1.getName()).compareTo(FilenameUtils.getBaseName(o2.getName()));
-			}
-		});
-		return Arrays.asList(files);
+		return Arrays.stream(files)
+			.sorted(Comparator.comparing(o -> FilenameUtils.getBaseName(o.getName())))
+			.collect(toList());
 	}
 
-	/**
-	 * Get the test report data as a json string.
-	 *
-	 * @param targetFile target file
-	 * @param interval   interval to collect data
-	 * @return json string
-	 */
-	private String getFileDataAsJson(File targetFile, int interval) {
+	private List<Float> getFileDataAsList(File targetFile, int interval) {
 		if (!targetFile.exists()) {
-			return "[]";
+			return Collections.emptyList();
 		}
-		StringBuilder reportData = new StringBuilder("[");
-		FileReader reader = null;
-		BufferedReader br = null;
-		try {
-			reader = new FileReader(targetFile);
-			br = new BufferedReader(reader);
+
+		List<Float> metrics = new ArrayList<>();
+		try (FileReader reader = new FileReader(targetFile);
+			 BufferedReader br = new BufferedReader(reader);){
+
 			String data = br.readLine();
 			int current = 0;
 			while (StringUtils.isNotBlank(data)) {
 				if (0 == current) {
-					reportData.append(data);
-					reportData.append(",");
+					if (data.equals(NULL_STRING)) {
+						metrics.add(null);
+					} else {
+						metrics.add(Float.parseFloat(data));
+					}
 				}
 				if (++current >= interval) {
 					current = 0;
 				}
 				data = br.readLine();
 			}
-			if (reportData.charAt(reportData.length() - 1) == ',') {
-				reportData.deleteCharAt(reportData.length() - 1);
-			}
 		} catch (IOException e) {
 			LOGGER.error("Report data retrieval is failed: {}", e.getMessage());
 			LOGGER.debug("Trace is : ", e);
-		} finally {
-			IOUtils.closeQuietly(reader);
-			IOUtils.closeQuietly(br);
 		}
-		return reportData.append("]").toString();
+		return metrics;
 	}
 
 	/*
 	 * (non-Javadoc)
-	 * 
+	 *
 	 * @see org.ngrinder.service.IPerfTestService#getAll(java.util.Date, java.util.Date)
 	 */
 	@Override
@@ -1592,7 +1499,7 @@ public class PerfTestService extends AbstractPerfTestService implements Controll
 
 	/*
 	 * (non-Javadoc)
-	 * 
+	 *
 	 * @see org.ngrinder.service.IPerfTestService#getAll(java.util.Date, java.util.Date, java.lang.String)
 	 */
 	@Override

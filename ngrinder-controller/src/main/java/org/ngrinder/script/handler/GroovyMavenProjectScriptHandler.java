@@ -42,7 +42,6 @@ import org.tmatesoft.svn.core.wc.SVNRevision;
 /**
  * Groovy Maven project {@link ScriptHandler}.
  *
- * @author JunHo Yoon
  * @since 3.2
  */
 @Component
@@ -145,6 +144,8 @@ public class GroovyMavenProjectScriptHandler extends GroovyScriptHandler impleme
 		MavenCli cli = new MavenCli();
 		processingResult.println("\nCopy dependencies by running 'mvn dependency:copy-dependencies"
 				+ " -DoutputDirectory=./lib -DexcludeScope=provided'");
+
+		System.setProperty(MavenCli.MULTIMODULE_PROJECT_DIRECTORY, distDir.getAbsolutePath());
 
 		int result = cli.doMain(new String[]{ // goal specification
 				"dependency:copy-dependencies", // run dependency goal

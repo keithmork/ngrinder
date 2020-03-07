@@ -1,4 +1,4 @@
-/* 
+/*
  * Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
  *  You may obtain a copy of the License at
@@ -9,7 +9,7 @@
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
- * limitations under the License. 
+ * limitations under the License.
  */
 package net.grinder.engine.agent;
 
@@ -25,11 +25,17 @@ import org.hyperic.sigar.SigarException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.net.ssl.SSLSocket;
 import java.io.File;
 import java.io.FilenameFilter;
+import java.io.IOException;
 import java.net.InetAddress;
-import java.util.List;
+import java.util.*;
 
+import static java.util.Collections.singletonList;
+import static javax.net.ssl.SSLSocketFactory.getDefault;
+import static org.ngrinder.common.constants.GrinderConstants.GRINDER_SECURITY_LEVEL_LIGHT;
+import static org.ngrinder.common.util.NoOp.noOp;
 import static org.ngrinder.common.util.Preconditions.checkNotEmpty;
 import static org.ngrinder.common.util.Preconditions.checkNotNull;
 
@@ -44,10 +50,13 @@ import static org.ngrinder.common.util.Preconditions.checkNotNull;
  */
 public class PropertyBuilder {
 	private static final Logger LOGGER = LoggerFactory.getLogger(ProcessBuilder.class);
+	private static final Set<String> DISABLED_SSL_PROTOCOLS = new HashSet<>(singletonList("SSLv2Hello"));
+
 	private final GrinderProperties properties;
 	private final Directory baseDirectory;
 	private final String hostName;
 	private final boolean securityEnabled;
+	private final String securityLevel;
 	private final String hostString;
 	private final boolean server;
 	private final boolean useXmxLimit;
@@ -69,12 +78,13 @@ public class PropertyBuilder {
 	 * @param additionalJavaOpt additional java option to be provided when invoking agent
 	 *                          process
 	 */
-	public PropertyBuilder(GrinderProperties properties, Directory baseDirectory, boolean securityEnabled,
+	public PropertyBuilder(GrinderProperties properties, Directory baseDirectory, boolean securityEnabled, String securityLevel,
 						   String hostString, String hostName, boolean server, boolean useXmxLimit, boolean enableLocalDNS, String additionalJavaOpt) {
 		this.enableLocalDNS = enableLocalDNS;
 		this.properties = checkNotNull(properties);
 		this.baseDirectory = checkNotNull(baseDirectory);
 		this.securityEnabled = securityEnabled;
+		this.securityLevel = securityLevel;
 		this.hostString = hostString;
 		this.hostName = checkNotEmpty(hostName);
 		this.server = server;
@@ -95,9 +105,9 @@ public class PropertyBuilder {
 	 * @param additionalJavaOpt additional java option to be provided when invoking agent
 	 *                          process
 	 */
-	public PropertyBuilder(GrinderProperties properties, Directory baseDirectory, boolean securityEnabled,
+	public PropertyBuilder(GrinderProperties properties, Directory baseDirectory, boolean securityEnabled, String securityLevel,
 						   String hostString, String hostName, boolean server, boolean useXmxLimit, String additionalJavaOpt) {
-		this(properties, baseDirectory, securityEnabled, hostString, hostName, server, useXmxLimit, true, additionalJavaOpt);
+		this(properties, baseDirectory, securityEnabled, securityLevel, hostString, hostName, server, useXmxLimit, true, additionalJavaOpt);
 	}
 
 	/**
@@ -111,9 +121,9 @@ public class PropertyBuilder {
 	 * @param server          server mode
 	 * @param useXmxLimit     true if 1G limit should be enabled
 	 */
-	public PropertyBuilder(GrinderProperties properties, Directory baseDirectory, boolean securityEnabled,
+	public PropertyBuilder(GrinderProperties properties, Directory baseDirectory, boolean securityEnabled, String securityLevel,
 						   String hostString, String hostName, boolean server, boolean useXmxLimit) {
-		this(properties, baseDirectory, securityEnabled, hostString, hostName, server, useXmxLimit, null);
+		this(properties, baseDirectory, securityEnabled, securityLevel, hostString, hostName, server, useXmxLimit, null);
 	}
 
 	/**
@@ -127,8 +137,8 @@ public class PropertyBuilder {
 	 * @param server          server mode
 	 */
 	public PropertyBuilder(GrinderProperties properties, Directory baseDirectory, boolean securityEnabled,
-						   String hostString, String hostName, boolean server) {
-		this(properties, baseDirectory, securityEnabled, hostString, hostName, server, true);
+						   String securityLevel, String hostString, String hostName, boolean server) {
+		this(properties, baseDirectory, securityEnabled, securityLevel, hostString, hostName, server, true);
 	}
 
 	/**
@@ -141,8 +151,8 @@ public class PropertyBuilder {
 	 * @param hostName        current host name
 	 */
 	public PropertyBuilder(GrinderProperties properties, Directory baseDirectory, boolean securityEnabled,
-						   String hostString, String hostName) {
-		this(properties, baseDirectory, securityEnabled, hostString, hostName, false);
+						   String securityLevel, String hostString, String hostName) {
+		this(properties, baseDirectory, securityEnabled, securityLevel, hostString, hostName, false);
 	}
 
 	/**
@@ -162,38 +172,76 @@ public class PropertyBuilder {
 	public String buildJVMArgumentWithoutMemory() {
 		StringBuilder jvmArguments = new StringBuilder();
 		if (securityEnabled) {
-			jvmArguments = addSecurityManager(jvmArguments);
-			jvmArguments = addCurrentAgentPath(jvmArguments);
-			jvmArguments = addConsoleIP(jvmArguments);
-			jvmArguments = addDnsIP(jvmArguments);
+			addSecurityManager(jvmArguments);
+			addCurrentAgentPath(jvmArguments);
+			addConsoleIP(jvmArguments);
+			addDnsIP(jvmArguments);
 		} else {
 			jvmArguments.append(properties.getProperty("grinder.jvm.arguments", ""));
-			jvmArguments = addNativeLibraryPath(jvmArguments);
+			addNativeLibraryPath(jvmArguments);
 		}
-		jvmArguments = addParam(jvmArguments, properties.getProperty("grinder.param", ""));
-		jvmArguments = addPythonPathJvmArgument(jvmArguments);
-		jvmArguments = addCustomDns(jvmArguments);
+
+		addParam(jvmArguments, properties.getProperty("grinder.param", ""));
+		addPythonPathJvmArgument(jvmArguments);
+		addCustomDns(jvmArguments);
+		addUserDir(jvmArguments);
+		addContext(jvmArguments);
+		addHttpsProtocols(jvmArguments);
+		disableSNIExtension(jvmArguments);
+
 		if (server) {
-			jvmArguments = addServerMode(jvmArguments);
+			addServerMode(jvmArguments);
 		}
 		if (StringUtils.isNotBlank(additionalJavaOpt)) {
-			jvmArguments = addAdditionalJavaOpt(jvmArguments);
+			addAdditionalJavaOpt(jvmArguments);
 		}
 		return jvmArguments.toString();
 	}
 
-	private StringBuilder addParam(StringBuilder jvmArguments, String param) {
+	protected StringBuilder disableSNIExtension(StringBuilder jvmArguments) {
+		return jvmArguments.append(" -Djsse.enableSNIExtension=false ");
+	}
+
+	protected StringBuilder addHttpsProtocols(StringBuilder jvmArguments) {
+		String[] sslProtocols = {"SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2"};
+
+		try {
+			SSLSocket socket = (SSLSocket) getDefault().createSocket();
+			sslProtocols = socket.getSupportedProtocols();
+		} catch (IOException e) {
+			noOp();
+		}
+
+		List<String> protocols = new ArrayList<>();
+		for (String protocol: sslProtocols) {
+			if (DISABLED_SSL_PROTOCOLS.contains(protocol)) {
+				continue;
+			}
+			protocols.add(protocol);
+		}
+
+		return jvmArguments
+			.append(" -Dhttps.protocols=")
+			.append(StringUtils.join(protocols, ","))
+			.append(" ");
+	}
+
+	protected StringBuilder addContext(StringBuilder jvmArguments) {
+		return jvmArguments.append(" -Dngrinder.context=agent ");
+	}
+
+	protected StringBuilder addParam(StringBuilder jvmArguments, String param) {
 		if (StringUtils.isEmpty(param)) {
 			return jvmArguments;
 		}
 		return jvmArguments.append(" -Dparam=").append(param).append(" ");
 	}
 
-	private StringBuilder addAdditionalJavaOpt(StringBuilder jvmArguments) {
+	protected StringBuilder addAdditionalJavaOpt(StringBuilder jvmArguments) {
 		return jvmArguments.append(" ").append(additionalJavaOpt).append(" ");
 	}
 
-	private StringBuilder addNativeLibraryPath(StringBuilder jvmArguments) {
+	protected StringBuilder addNativeLibraryPath(StringBuilder jvmArguments) {
 		return jvmArguments.append(" -Djna.library.path=").append(new File(baseDirectory.getFile(), "/lib"))
 				.append(" ");
 	}
@@ -248,7 +296,15 @@ public class PropertyBuilder {
 	}
 
 	protected StringBuilder addSecurityManager(StringBuilder jvmArguments) {
-		return jvmArguments.append(" -Djava.security.manager=org.ngrinder.sm.NGrinderSecurityManager ");
+		return jvmArguments.append(" -Djava.security.manager=" + getSecurityManagerBySecurityLevel(securityLevel) + " ");
+	}
+
+	private String getSecurityManagerBySecurityLevel(String securityLevel) {
+		if (GRINDER_SECURITY_LEVEL_LIGHT.equalsIgnoreCase(securityLevel)) {
+			return "org.ngrinder.sm.NGrinderLightSecurityManager";
+		} else {
+			return "org.ngrinder.sm.NGrinderSecurityManager";
+		}
 	}
 
 	private String getPath(File file, boolean useAbsolutePath) {
@@ -354,6 +410,11 @@ public class PropertyBuilder {
 		if (enableLocalDNS) {
 			jvmArguments.append(" -Dsun.net.spi.nameservice.provider.1=dns,LocalManagedDns ");
 		}
+		return jvmArguments;
+	}
+
+	private StringBuilder addUserDir(StringBuilder jvmArguments) {
+		jvmArguments.append(" -Duser.dir=" + baseDirectory.getFile().getPath() + " ");
 		return jvmArguments;
 	}
 

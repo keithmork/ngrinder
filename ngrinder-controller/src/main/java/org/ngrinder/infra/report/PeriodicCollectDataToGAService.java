@@ -22,7 +22,6 @@ import org.ngrinder.http.MeasureProtocolRequest;
 import org.ngrinder.infra.config.Config;
 import org.ngrinder.model.PerfTest;
 import org.ngrinder.perftest.service.PerfTestService;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -32,19 +31,20 @@ import java.util.Date;
 import java.util.List;
 import java.util.Random;
 
+import lombok.RequiredArgsConstructor;
+
 /**
  * Send the ngrinder usage data to GA. It executes only once each day at midnight
  *
  * @since 3.2
  */
 @Service
+@RequiredArgsConstructor
 public class PeriodicCollectDataToGAService {
 
-	@Autowired
-	private Config config;
+	private final Config config;
 
-	@Autowired
-	private PerfTestService perfTestService;
+	private final PerfTestService perfTestService;
 
 	/**
 	 * Send the number of executed test.
@@ -84,12 +84,4 @@ public class PeriodicCollectDataToGAService {
 		return perfTests.size();
 	}
 
-	/**
-	 * For unit test.
-	 *
-	 * @param config config
-	 */
-	void setConfig(Config config) {
-		this.config = config;
-	}
 }

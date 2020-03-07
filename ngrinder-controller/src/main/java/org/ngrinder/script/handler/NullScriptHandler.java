@@ -28,7 +28,6 @@ import org.springframework.stereotype.Component;
 /**
  * Null {@link ScriptHandler} which implements Null object pattern.
  *
- * @author JunHo Yoon
  * @since 3.2
  */
 @Component
@@ -36,9 +35,6 @@ public class NullScriptHandler extends ScriptHandler {
 
 	private Map<FileType, String> codeMirrorKey = newHashMap();
 
-	/**
-	 * Constructor.
-	 */
 	public NullScriptHandler() {
 		super("", "", null, null);
 		codeMirrorKey.put(FileType.PROPERTIES, "properties");
@@ -85,7 +81,6 @@ public class NullScriptHandler extends ScriptHandler {
 
 	@Override
 	public String checkSyntaxErrors(String path, String content) {
-		// TODO Auto-generated method stub
 		return null;
 	}
 }

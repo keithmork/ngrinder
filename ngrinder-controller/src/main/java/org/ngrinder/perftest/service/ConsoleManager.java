@@ -13,15 +13,15 @@
  */
 package org.ngrinder.perftest.service;
 
+import lombok.RequiredArgsConstructor;
 import net.grinder.SingleConsole;
 import net.grinder.console.model.ConsoleCommunicationSetting;
 import net.grinder.console.model.ConsoleProperties;
-import org.h2.util.StringUtils;
+import org.apache.commons.lang.StringUtils;
 import org.ngrinder.infra.config.Config;
 import org.ngrinder.perftest.model.NullSingleConsole;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
@@ -44,22 +44,19 @@ import static org.ngrinder.common.util.NoOp.noOp;
  * requires a new console, it gets the one {@link ConsoleEntry} from the pool and creates new console with the
  * {@link ConsoleEntry}. Currently using consoles are kept in {@link #consoleInUse} member variable.
  *
- * @author JunHo Yoon
  * @since 3.0
  */
 @Component
+@RequiredArgsConstructor
 public class ConsoleManager {
 	private static final int MAX_PORT_NUMBER = 65000;
 	private static final Logger LOG = LoggerFactory.getLogger(ConsoleManager.class);
 	private volatile ArrayBlockingQueue<ConsoleEntry> consoleQueue;
-	private volatile List<SingleConsole> consoleInUse = Collections.synchronizedList(new ArrayList<SingleConsole>());
+	private volatile List<SingleConsole> consoleInUse = Collections.synchronizedList(new ArrayList<>());
 
-	@Autowired
-	private Config config;
+	private final Config config;
 
-	@Autowired
-	private AgentManager agentManager;
-
+	private final AgentManager agentManager;
 
 	/**
 	 * Prepare console queue.
@@ -67,7 +64,7 @@ public class ConsoleManager {
 	@PostConstruct
 	public void init() {
 		int consoleSize = getConsoleSize();
-		consoleQueue = new ArrayBlockingQueue<ConsoleEntry>(consoleSize);
+		consoleQueue = new ArrayBlockingQueue<>(consoleSize);
 		final String currentIP = config.getCurrentIP();
 		for (int each : getAvailablePorts(currentIP, consoleSize, getConsolePortBase(), MAX_PORT_NUMBER)) {
 			final ConsoleEntry e = new ConsoleEntry(config.getCurrentIP(), each);

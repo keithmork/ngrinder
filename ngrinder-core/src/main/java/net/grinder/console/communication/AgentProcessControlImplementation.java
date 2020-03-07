@@ -30,14 +30,15 @@ import net.grinder.messages.console.AgentAddress;
 import net.grinder.util.ListenerSupport;
 import net.grinder.util.ListenerSupport.Informer;
 import org.ngrinder.monitor.controller.model.SystemDataModel;
-import org.python.google.common.base.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 
+import static java.util.Collections.unmodifiableMap;
 import static org.ngrinder.common.util.CollectionUtils.newLinkedHashSet;
 
 /**
@@ -49,10 +50,10 @@ import static org.ngrinder.common.util.CollectionUtils.newLinkedHashSet;
 public class AgentProcessControlImplementation implements AgentProcessControl {
 
 	private final ConsoleCommunication m_consoleCommunication;
-	private Map<AgentIdentity, AgentStatus> m_agentMap = new ConcurrentHashMap<AgentIdentity, AgentStatus>();
-	private final ListenerSupport<Listener> m_listeners = new ListenerSupport<Listener>();
-	private final ListenerSupport<LogArrivedListener> m_logListeners = new ListenerSupport<LogArrivedListener>();
-	private AgentDownloadRequestListener m_agentDownloadListener;
+	private Map<AgentIdentity, AgentStatus> m_agentMap = new ConcurrentHashMap<>();
+	private final ListenerSupport<AgentStatusUpdateListener> m_agentStatusUpdateListeners = new ListenerSupport<>();
+	private final ListenerSupport<LogArrivedListener> m_logListeners = new ListenerSupport<>();
+	private final ListenerSupport<AgentDownloadRequestListener> m_agentDownloadRequestListeners = new ListenerSupport<>();
 
 	private static final Logger LOGGER = LoggerFactory.getLogger(AgentProcessControlImplementation.class);
 	/**
@@ -80,7 +81,9 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 		m_consoleCommunication = consoleCommunication;
 		timer.schedule(new TimerTask() {
 			public void run() {
-				update();
+				synchronized (m_agentMap) {
+					update();
+				}
 			}
 		}, 0, UPDATE_PERIOD);
 
@@ -96,7 +99,7 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 		messageDispatchRegistry.set(AgentControllerProcessReportMessage.class,
 				new AbstractHandler<AgentControllerProcessReportMessage>() {
 					public void handle(AgentControllerProcessReportMessage message) {
-						addAgentStatusReport(message);
+						updateAgentProcessReportMessage(message);
 					}
 				});
 
@@ -113,20 +116,29 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 
 		messageDispatchRegistry.set(AgentDownloadGrinderMessage.class, new AbstractHandler<AgentDownloadGrinderMessage>() {
 			public void handle(final AgentDownloadGrinderMessage message) {
-				final AgentUpdateGrinderMessage agentUpdateGrinderMessage = m_agentDownloadListener.onAgentDownloadRequested(message.getVersion(), message.getNext());
-				m_consoleCommunication.sendToAddressedAgents(message.getAddress(), agentUpdateGrinderMessage);
+				m_agentDownloadRequestListeners.apply(new Informer<AgentDownloadRequestListener>() {
+					@Override
+					public void inform(AgentDownloadRequestListener listener) {
+						AgentUpdateGrinderMessage agentUpdateGrinderMessage = listener.onAgentDownloadRequested(message.getVersion(), message.getNext());
+						if (agentUpdateGrinderMessage != null) {
+							m_consoleCommunication.sendToAddressedAgents(message.getAddress(), agentUpdateGrinderMessage);
+						}
+					}
+				});
 			}
 		});
 	}
 
 	/**
-	 * Add Agent status report.
+	 * Set Agent status report.
 	 *
 	 * @param message {@link AgentControllerProcessReportMessage}
 	 */
-	public void addAgentStatusReport(AgentControllerProcessReportMessage message) {
-		AgentStatus agentStatus = getAgentStatus(message.getAgentIdentity());
+	private void updateAgentProcessReportMessage(AgentControllerProcessReportMessage message) {
+		AgentIdentity agentIdentity = message.getAgentIdentity();
+		AgentStatus agentStatus = getAgentStatus(agentIdentity);
 		agentStatus.setAgentProcessStatus(message);
+		m_agentMap.put(agentIdentity, agentStatus);
 		m_newData = true;
 	}
 
@@ -137,17 +149,7 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 	 * @return {@link AgentStatus}
 	 */
 	private AgentStatus getAgentStatus(AgentIdentity agentIdentity) {
-		synchronized (m_agentMap) {
-			final AgentStatus existing = m_agentMap.get(agentIdentity);
-			if (existing != null) {
-				m_agentMap.put(agentIdentity, existing);
-				return existing;
-			}
-
-			final AgentStatus created = new AgentStatus(agentIdentity);
-			m_agentMap.put(agentIdentity, created);
-			return created;
-		}
+		return m_agentMap.getOrDefault(agentIdentity, new AgentStatus(agentIdentity));
 	}
 
 	/**
@@ -160,27 +162,27 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 
 		m_newData = false;
 
-		m_listeners.apply(new ListenerSupport.Informer<Listener>() {
-			public void inform(Listener l) {
-				l.update(new ConcurrentHashMap<AgentIdentity, AgentStatus>(m_agentMap));
+		m_agentStatusUpdateListeners.apply(new ListenerSupport.Informer<AgentStatusUpdateListener>() {
+			public void inform(AgentStatusUpdateListener agentStatusUpdateListener) {
+				agentStatusUpdateListener.update(unmodifiableMap(m_agentMap));
 			}
 		});
 	}
 
-	public void setAgentDownloadListener(AgentDownloadRequestListener agentDownloadListener) {
-		this.m_agentDownloadListener = agentDownloadListener;
+	public void addAgentDownloadRequestListener(AgentDownloadRequestListener agentDownloadRequestListener) {
+		m_agentDownloadRequestListeners.add(agentDownloadRequestListener);
 	}
 
 	/**
 	 * Interface for listeners to SampleModelImplementation.
 	 */
-	interface Listener extends EventListener {
+	public interface AgentStatusUpdateListener extends EventListener {
 		/**
 		 * Update agent status.
 		 *
 		 * @param agentMap agent map
 		 */
-		public void update(Map<AgentIdentity, AgentStatus> agentMap);
+		void update(Map<AgentIdentity, AgentStatus> agentMap);
 	}
 
 	/**
@@ -190,7 +192,7 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 	 */
 	private void purge(Map<? extends ProcessIdentity, ? extends Purgable> purgableMap) {
 
-		final Set<ProcessIdentity> zombies = new HashSet<ProcessIdentity>();
+		final Set<ProcessIdentity> zombies = new HashSet<>();
 
 		for (Entry<? extends ProcessIdentity, ? extends Purgable> entry : purgableMap.entrySet()) {
 			if (entry.getValue().shouldPurge()) {
@@ -199,7 +201,9 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 		}
 
 		if (zombies.size() > 0) {
-			purgableMap.keySet().removeAll(zombies);
+			for (ProcessIdentity processIdentity: zombies) {
+				purgableMap.remove(processIdentity);
+			}
 			m_newData = true;
 		}
 	}
@@ -228,6 +232,10 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 
 			return false;
 		}
+
+		public void initPurgeDelayCount() {
+			m_purgeDelayCount = 0;
+		}
 	}
 
 	private final class AgentReference extends AbstractTimedReference {
@@ -240,18 +248,6 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 		 */
 		AgentReference(AgentControllerProcessReportMessage agentProcessReportMessage) {
 			this.m_agentProcessReportMessage = agentProcessReportMessage;
-		}
-
-		@Override
-		public boolean shouldPurge() {
-			final boolean purge = super.shouldPurge();
-			if (purge) {
-				// Protected against race with add since the caller holds
-				// m_agentIdentityToAgentAndWorkers, and we are about to be
-				// removed from m_agentIdentityToAgentAndWorkers.
-				m_agentMap.remove(m_agentProcessReportMessage.getAgentIdentity());
-			}
-			return purge;
 		}
 	}
 
@@ -296,7 +292,6 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 		 * @param message Message
 		 */
 		public void setAgentProcessStatus(AgentControllerProcessReportMessage message) {
-			LOGGER.trace("agent perf status on {} is {}", message.getAgentIdentity(), message.getSystemDataModel());
 			m_agentReference = new AgentReference(message);
 		}
 
@@ -323,12 +318,12 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 	}
 
 	/**
-	 * Add process control {@link Listener}.
+	 * Add process control {@link AgentStatusUpdateListener}.
 	 *
-	 * @param listener listener to be added
+	 * @param agentStatusUpdateListener agentStatusUpdateListener to be added
 	 */
-	public void addListener(Listener listener) {
-		m_listeners.add(listener);
+	public void addAgentStatusUpdateListener(AgentStatusUpdateListener agentStatusUpdateListener) {
+		m_agentStatusUpdateListeners.add(agentStatusUpdateListener);
 	}
 
 	/**
@@ -389,7 +384,7 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 		count = count == 0 ? Integer.MAX_VALUE : count;
 		synchronized (m_agentMap) {
 			int i = 0;
-			Set<AgentIdentity> agents = new HashSet<AgentIdentity>();
+			Set<AgentIdentity> agents = new HashSet<>();
 			for (Map.Entry<AgentIdentity, AgentStatus> each : m_agentMap.entrySet()) {
 				if (each.getValue().getAgentControllerState().equals(state) && ++i <= count) {
 					agents.add(each.getKey());
@@ -467,7 +462,7 @@ public class AgentProcessControlImplementation implements AgentProcessControl {
 	public Set<AgentStatus> getAgentStatusSet(Predicate<AgentStatus> predicate) {
 		Set<AgentStatus> statusSet = newLinkedHashSet();
 		for (Entry<AgentIdentity, AgentStatus> each : m_agentMap.entrySet()) {
-			if (predicate.apply(each.getValue())) {
+			if (predicate.test(each.getValue())) {
 				statusSet.add(each.getValue());
 			}
 		}

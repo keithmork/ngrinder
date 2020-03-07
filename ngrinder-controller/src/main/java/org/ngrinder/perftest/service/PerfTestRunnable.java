@@ -13,6 +13,8 @@
  */
 package org.ngrinder.perftest.service;
 
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 import net.grinder.SingleConsole;
 import net.grinder.SingleConsole.ConsoleShutdownListener;
 import net.grinder.StopReason;
@@ -23,20 +25,20 @@ import net.grinder.util.ListenerSupport;
 import net.grinder.util.UnitUtils;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang.time.DateUtils;
+import org.ngrinder.agent.service.AgentService;
 import org.ngrinder.common.constant.ControllerConstants;
 import org.ngrinder.extension.OnTestLifeCycleRunnable;
 import org.ngrinder.extension.OnTestSamplingRunnable;
 import org.ngrinder.infra.config.Config;
+import org.ngrinder.infra.hazelcast.HazelcastService;
 import org.ngrinder.infra.plugin.PluginManager;
 import org.ngrinder.infra.schedule.ScheduledTaskService;
 import org.ngrinder.model.PerfTest;
 import org.ngrinder.model.Status;
 import org.ngrinder.perftest.model.NullSingleConsole;
 import org.ngrinder.perftest.service.samplinglistener.*;
-import org.ngrinder.script.handler.ScriptHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
@@ -48,6 +50,8 @@ import java.util.Date;
 import java.util.List;
 
 import static org.apache.commons.lang.ObjectUtils.defaultIfNull;
+import static org.ngrinder.common.constant.CacheConstants.DIST_MAP_NAME_MONITORING;
+import static org.ngrinder.common.constant.CacheConstants.DIST_MAP_NAME_SAMPLING;
 import static org.ngrinder.common.constant.ClusterConstants.PROP_CLUSTER_SAFE_DIST;
 import static org.ngrinder.common.util.AccessUtils.getSafe;
 import static org.ngrinder.model.Status.*;
@@ -59,33 +63,33 @@ import static org.ngrinder.model.Status.*;
  * started from {@link #doStart()}  and {@link #doFinish()} method. These
  * methods are scheduled by Spring Task.
  *
- * @author JunHo Yoon
  * @since 3.0
  */
 @Profile("production")
 @Component
+@RequiredArgsConstructor
 public class PerfTestRunnable implements ControllerConstants {
 
 	private static final Logger LOG = LoggerFactory.getLogger(PerfTestRunnable.class);
 
-	@SuppressWarnings("SpringJavaAutowiringInspection")
-	@Autowired
-	private PerfTestService perfTestService;
+	@Getter
+	private final PerfTestService perfTestService;
 
-	@Autowired
-	private ConsoleManager consoleManager;
+	@Getter
+	private final AgentManager agentManager;
 
-	@Autowired
-	private AgentManager agentManager;
+	private final ConsoleManager consoleManager;
 
-	@Autowired
-	private PluginManager pluginManager;
+	private final PluginManager pluginManager;
 
-	@Autowired
-	private Config config;
+	private final Config config;
 
-	@Autowired
-	private ScheduledTaskService scheduledTaskService;
+	private final ScheduledTaskService scheduledTaskService;
+
+	private final HazelcastService hazelcastService;
+
+	@Getter
+	private final AgentService agentService;
 
 	private Runnable startRunnable;
 
@@ -96,19 +100,9 @@ public class PerfTestRunnable implements ControllerConstants {
 		// Clean up db first.
 		doFinish(true);
 
-		this.startRunnable = new Runnable() {
-			@Override
-			public void run() {
-				startPeriodically();
-			}
-		};
+		this.startRunnable = this::startPeriodically;
 		scheduledTaskService.addFixedDelayedScheduledTask(startRunnable, PERFTEST_RUN_FREQUENCY_MILLISECONDS);
-		this.finishRunnable = new Runnable() {
-			@Override
-			public void run() {
-				finishPeriodically();
-			}
-		};
+		this.finishRunnable = this::finishPeriodically;
 		scheduledTaskService.addFixedDelayedScheduledTask(finishRunnable, PERFTEST_RUN_FREQUENCY_MILLISECONDS);
 
 	}
@@ -182,7 +176,7 @@ public class PerfTestRunnable implements ControllerConstants {
 	 * @return true if enough agents
 	 */
 	protected boolean hasEnoughFreeAgents(PerfTest test) {
-		int size = agentManager.getAllFreeApprovedAgentsForUser(test.getCreatedUser()).size();
+		int size = agentService.getAllAttachedFreeApprovedAgentsForUser(test.getCreatedUser().getUserId()).size();
 		if (test.getAgentCount() != null && test.getAgentCount() > size) {
 			perfTestService.markProgress(test, "The test is tried to execute but there is not enough free agents."
 					+ "\n- Current free agent count : " + size + "  / Requested : " + test.getAgentCount() + "\n");
@@ -201,9 +195,8 @@ public class PerfTestRunnable implements ControllerConstants {
 	public void doTest(final PerfTest perfTest) {
 		SingleConsole singleConsole = null;
 		try {
+			GrinderProperties grinderProperties = perfTestService.prepareTest(perfTest);
 			singleConsole = startConsole(perfTest);
-			ScriptHandler prepareDistribution = perfTestService.prepareDistribution(perfTest);
-			GrinderProperties grinderProperties = perfTestService.getGrinderProperties(perfTest, prepareDistribution);
 			startAgentsOn(perfTest, grinderProperties, checkCancellation(singleConsole));
 			distributeFileOn(perfTest, checkCancellation(singleConsole));
 
@@ -262,7 +255,7 @@ public class PerfTestRunnable implements ControllerConstants {
 		// Distribute files
 		perfTestService.markStatusAndProgress(perfTest, DISTRIBUTE_FILES, "All necessary files are being distributed.");
 		ListenerSupport<SingleConsole.FileDistributionListener> listener = ListenerHelper.create();
-		final long safeThreadHold = getSafeTransmissionThreshold();
+		final long safeThreshold = getSafeTransmissionThreshold();
 
 		listener.add(new SingleConsole.FileDistributionListener() {
 			@Override
@@ -277,9 +270,9 @@ public class PerfTestRunnable implements ControllerConstants {
 					return safe;
 				}
 				long sizeOfDirectory = FileUtils.sizeOfDirectory(dir);
-				if (sizeOfDirectory > safeThreadHold) {
+				if (sizeOfDirectory > safeThreshold) {
 					perfTestService.markProgress(perfTest, "The total size of distributed files is over "
-							+ UnitUtils.byteCountToDisplaySize(safeThreadHold) + "B.\n- Safe file distribution mode is enabled by force.");
+							+ UnitUtils.byteCountToDisplaySize(safeThreshold) + "B.\n- Safe file distribution mode is enabled by force.");
 					return true;
 				}
 				return safe;
@@ -316,7 +309,7 @@ public class PerfTestRunnable implements ControllerConstants {
 	void startAgentsOn(PerfTest perfTest, GrinderProperties grinderProperties, SingleConsole singleConsole) {
 		perfTestService.markStatusAndProgress(perfTest, START_AGENTS, getSafe(perfTest.getAgentCount())
 				+ " agents are starting.");
-		agentManager.runAgent(perfTest.getCreatedUser(), singleConsole, grinderProperties,
+		agentService.runAgent(perfTest.getCreatedUser(), singleConsole, grinderProperties,
 				getSafe(perfTest.getAgentCount()));
 		singleConsole.waitUntilAgentConnected(perfTest.getAgentCount());
 		perfTestService.markStatusAndProgress(perfTest, START_AGENTS_FINISHED, getSafe(perfTest.getAgentCount())
@@ -441,7 +434,8 @@ public class PerfTestRunnable implements ControllerConstants {
 	 */
 	private void cleanUp(PerfTest perfTest) {
 		perfTestService.cleanUpDistFolder(perfTest);
-		perfTestService.cleanUpRuntimeOnlyData(perfTest);
+		hazelcastService.delete(DIST_MAP_NAME_MONITORING, perfTest.getId());
+		hazelcastService.delete(DIST_MAP_NAME_SAMPLING, perfTest.getId());
 	}
 
 	/**
@@ -457,19 +451,19 @@ public class PerfTestRunnable implements ControllerConstants {
 				&& singleConsoleInUse.isCurrentRunningTimeOverDuration(perfTest.getDuration())) {
 			LOG.debug(
 					"Test {} is ready to finish. Current : {}, Planned : {}",
-					new Object[]{perfTest.getTestIdentifier(), singleConsoleInUse.getCurrentRunningTime(),
-							perfTest.getDuration()});
+				perfTest.getTestIdentifier(), singleConsoleInUse.getCurrentRunningTime(),
+				perfTest.getDuration());
 			return true;
 		} else if (perfTest.isThresholdRunCount()
 				&& singleConsoleInUse.getCurrentExecutionCount() >= perfTest.getTotalRunCount()) {
 			LOG.debug("Test {} is ready to finish. Current : {}, Planned : {}",
-					new Object[]{perfTest.getTestIdentifier(), singleConsoleInUse.getCurrentExecutionCount(),
-							perfTest.getTotalRunCount()});
+				perfTest.getTestIdentifier(), singleConsoleInUse.getCurrentExecutionCount(),
+				perfTest.getTotalRunCount());
 			return true;
 		} else if (singleConsoleInUse instanceof NullSingleConsole) {
 			LOG.debug("Test {} is ready to finish. Current : {}, Planned : {}",
-					new Object[]{perfTest.getTestIdentifier(), singleConsoleInUse.getCurrentExecutionCount(),
-							perfTest.getTotalRunCount()});
+				perfTest.getTestIdentifier(), singleConsoleInUse.getCurrentExecutionCount(),
+				perfTest.getTotalRunCount());
 			return true;
 		}
 
@@ -544,14 +538,6 @@ public class PerfTestRunnable implements ControllerConstants {
 			LOG.debug("Details : ", e);
 		}
 		consoleManager.returnBackConsole(perfTest.getTestIdentifier(), singleConsoleInUse);
-	}
-
-	public PerfTestService getPerfTestService() {
-		return perfTestService;
-	}
-
-	public AgentManager getAgentManager() {
-		return agentManager;
 	}
 
 }

@@ -20,29 +20,29 @@ import org.ngrinder.infra.plugin.PluginManager;
 import org.ngrinder.model.User;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.stereotype.Service;
 
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
 /**
  * NGrinder {@link UserDetailsService}.
  *
  * This resolves user info using plugins implementing {@link OnLoginRunnable}.
- *
- * @author JunHo Yoon
  */
 @Service("ngrinderUserDetailsService")
+@RequiredArgsConstructor
 public class NGrinderUserDetailsService implements UserDetailsService {
 
 	protected static final Logger LOG = LoggerFactory.getLogger(NGrinderUserDetailsService.class);
 
-	@Autowired
-	private PluginManager pluginManager;
+	@Getter
+	private final PluginManager pluginManager;
 
-	@Autowired
-	private DefaultLoginPlugin defaultPlugin;
+	private final DefaultLoginPlugin defaultPlugin;
 
 	@Override
 	public UserDetails loadUserByUsername(String userId) {
@@ -57,13 +57,5 @@ public class NGrinderUserDetailsService implements UserDetailsService {
 			}
 		}
 		throw new UsernameNotFoundException(userId + " is not found.");
-	}
-
-	public PluginManager getPluginManager() {
-		return pluginManager;
-	}
-
-	public void setPluginManager(PluginManager pluginManager) {
-		this.pluginManager = pluginManager;
 	}
 }
